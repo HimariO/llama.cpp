@@ -6389,15 +6389,23 @@ static struct ggml_tensor * ggml_rope_impl(
         GGML_ASSERT(c->ne[0] >= n_dims / 2);
     }
 
+    bool is_node = false;
+    int sections[3] = {0, 0, 0};
+
+    if (a->grad) {
+        is_node = true;
+    }
+
     struct ggml_tensor * result = inplace ? ggml_view_tensor(ctx, a) : ggml_dup_tensor(ctx, a);
 
-    int32_t params[11] = { /*n_past*/ 0, n_dims, mode, /*n_ctx*/ 0, n_ctx_orig };
+    int32_t params[14] = { /*n_past*/ 0, n_dims, mode, /*n_ctx*/ 0, n_ctx_orig };
     memcpy(params +  5, &freq_base,    sizeof(float));
     memcpy(params +  6, &freq_scale,   sizeof(float));
     memcpy(params +  7, &ext_factor,   sizeof(float));
     memcpy(params +  8, &attn_factor,  sizeof(float));
     memcpy(params +  9, &beta_fast,    sizeof(float));
     memcpy(params + 10, &beta_slow,    sizeof(float));
+    memcpy(params + 11, &sections,    sizeof(int) * 3);
     ggml_set_op_params(result, params, sizeof(params));
 
     result->op     = GGML_OP_ROPE;
@@ -6417,6 +6425,61 @@ struct ggml_tensor * ggml_rope(
     return ggml_rope_impl(
         ctx, a, b, NULL, n_dims, mode, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f, false
     );
+}
+
+struct ggml_tensor * ggml_mrope_ext(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * c,
+        int                   n_dims,
+        int                   mode,
+        int                   n_ctx_orig,
+        float                 freq_base,
+        float                 freq_scale,
+        float                 ext_factor,
+        float                 attn_factor,
+        float                 beta_fast,
+        float                 beta_slow) {
+
+    int sections[3] = {16, 24, 24};  // TODO: move this into gguf model file.
+
+    GGML_ASSERT((mode & 1) == 0 && "mode & 1 == 1 is no longer supported");
+
+    GGML_ASSERT(ggml_is_vector(b));
+    GGML_ASSERT(b->type == GGML_TYPE_I32);
+    GGML_ASSERT(a->ne[2] * 3 == b->ne[0]);
+
+    if (c) {
+        GGML_ASSERT(c->type == GGML_TYPE_F32);
+        GGML_ASSERT(c->ne[0] >= n_dims / 2);
+    }
+
+    bool is_node = false;
+
+    if (a->grad) {
+        is_node = true;
+    }
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, a);
+
+    int32_t params[11 + 3] = { /*n_past*/ 0, n_dims, mode, /*n_ctx*/ 0, n_ctx_orig };
+    memcpy(params +  5, &freq_base,    sizeof(float));
+    memcpy(params +  6, &freq_scale,   sizeof(float));
+    memcpy(params +  7, &ext_factor,   sizeof(float));
+    memcpy(params +  8, &attn_factor,  sizeof(float));
+    memcpy(params +  9, &beta_fast,    sizeof(float));
+    memcpy(params + 10, &beta_slow,    sizeof(float));
+    memcpy(params + 11, &sections,    sizeof(int) * 3);
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op   = GGML_OP_ROPE;
+    result->grad = is_node ? ggml_dup_tensor(ctx, result) : NULL;
+    result->src[0] = a;
+    result->src[1] = b;
+    result->src[2] = c;
+
+    return result;
 }
 
 struct ggml_tensor * ggml_rope_inplace(
@@ -14060,6 +14123,35 @@ static void ggml_rope_cache_init(
     }
 }
 
+static void ggml_mrope_cache_init(
+     float theta_base_t, float theta_base_h, float theta_base_w, int sections[3],
+     float freq_scale, const float * freq_factors, float corr_dims[2], int64_t ne0, float ext_factor, float mscale,
+     float * cache, float sin_sign, float theta_scale) {
+    // ref: https://github.com/jquesnelle/yarn/blob/master/scaled_rope/LlamaYaRNScaledRotaryEmbedding.py
+    float theta_t = theta_base_t;
+    float theta_h = theta_base_h;
+    float theta_w = theta_base_w;
+    int sect_dims = sections[0] + sections[1] + sections[2];
+    
+    for (int64_t i0 = 0; i0 < ne0; i0 += 2) {
+        const float ff = freq_factors ? freq_factors[i0/2] : 1.0f;
+        
+        float theta = theta_base_t;
+        int sector = i0 % sect_dims;
+        if (sector > sections[1] && sector >= sections[0])
+            theta = theta_base_h;
+        else if (sector >= sections[1])
+            theta = theta_base_w;
+        
+        rope_yarn(
+            theta/ff, freq_scale, corr_dims, i0, ext_factor, mscale, &cache[i0 + 0], &cache[i0 + 1]
+        );
+        cache[i0 + 1] *= sin_sign;
+
+        theta *= theta_scale;
+    }
+}
+
 GGML_CALL void ggml_rope_yarn_corr_dims(
     int n_dims, int n_ctx_orig, float freq_base, float beta_fast, float beta_slow, float dims[2]
 ) {
@@ -14080,6 +14172,7 @@ static void ggml_compute_forward_rope_f32(
     const struct ggml_tensor * src2 = dst->src[2];
 
     float freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow;
+    int sections[3];
 
     //const int n_past     = ((int32_t *) dst->op_params)[0];
     const int n_dims     = ((int32_t *) dst->op_params)[1];
@@ -14093,6 +14186,7 @@ static void ggml_compute_forward_rope_f32(
     memcpy(&attn_factor, (int32_t *) dst->op_params +  8, sizeof(float));
     memcpy(&beta_fast,   (int32_t *) dst->op_params +  9, sizeof(float));
     memcpy(&beta_slow,   (int32_t *) dst->op_params + 10, sizeof(float));
+    memcpy(&sections,   (int32_t *) dst->op_params + 11, sizeof(int) * 3);
 
     GGML_TENSOR_UNARY_OP_LOCALS
 
@@ -14125,6 +14219,7 @@ static void ggml_compute_forward_rope_f32(
     ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, corr_dims);
 
     const bool is_neox = mode & GGML_ROPE_TYPE_NEOX;
+    const bool is_mrope = sections[0] > 0 || sections[1] > 0 || sections[2] > 0;
 
     const float * freq_factors = NULL;
     if (src2 != NULL) {
@@ -14140,14 +14235,24 @@ static void ggml_compute_forward_rope_f32(
 
     const int32_t * pos = (const int32_t *) src1->data;
 
-    for (int64_t i3 = 0; i3 < ne3; i3++) {
-        for (int64_t i2 = 0; i2 < ne2; i2++) {
-            const int64_t p = pos[i2];
+    for (int64_t i3 = 0; i3 < ne3; i3++) { // batch
+        for (int64_t i2 = 0; i2 < ne2; i2++) { // seq-len
 
             float * cache = (float *) params->wdata + (ne0 + CACHE_LINE_SIZE_F32)*ith;
-            ggml_rope_cache_init(p, freq_scale, freq_factors, corr_dims, ne0, ext_factor, attn_factor, cache, sin_sign, theta_scale);
+            if (!is_mrope) {
+                const int64_t p = pos[i2];
+                ggml_rope_cache_init(p, freq_scale, freq_factors, corr_dims, ne0, ext_factor, attn_factor, cache, sin_sign, theta_scale);
+            }
+            else {
+                const int64_t p_t = pos[i2];
+                const int64_t p_h = pos[i2 + ne2];
+                const int64_t p_w = pos[i2 + ne2 * 2];
+                ggml_mrope_cache_init(
+                    p_t, p_h, p_w, sections, 
+                    freq_scale, freq_factors, corr_dims, ne0, ext_factor, attn_factor, cache, sin_sign, theta_scale);
+            }
 
-            for (int64_t i1 = 0; i1 < ne1; i1++) {
+            for (int64_t i1 = 0; i1 < ne1; i1++) { // attn-heads
                 if (ir++ < ir0) continue;
                 if (ir   > ir1) break;
 
